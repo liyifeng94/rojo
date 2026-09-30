@@ -23,6 +23,18 @@ return function(instanceMap, propertyChanges)
 			continue
 		end
 
+		-- Instances that aren't going to be saved anyway, such as the Rojo
+		-- session lock value, should never be encoded into a live-sync patch.
+		-- Some of their properties (e.g. an ObjectValue's Value) may be Refs
+		-- that cannot be encoded on their own, which would error every batch.
+		local success, isUnarchivable = pcall(function()
+			return instance.Archivable == false
+		end)
+		if success and isUnarchivable then
+			propertyChanges[instance] = nil
+			continue
+		end
+
 		if properties.Parent then
 			if instance.Parent == nil then
 				table.insert(patch.removed, instanceId)

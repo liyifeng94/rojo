@@ -57,6 +57,51 @@ return function()
 		expect(#patch.updated).to.equal(0)
 	end)
 
+	it("should ignore changes to instances that are not archivable", function()
+		local instanceMap = InstanceMap.new()
+
+		local lock = Instance.new("ObjectValue")
+		lock.Archivable = false
+		instanceMap:insert("LOCK", lock)
+
+		local changes = {
+			[lock] = {
+				Value = true,
+			},
+		}
+
+		local patch = createPatchSet(instanceMap, changes)
+
+		expect(#patch.updated).to.equal(0)
+		expect(#patch.removed).to.equal(0)
+		expect(next(changes)).to.equal(nil)
+	end)
+
+	it("should skip Ref properties instead of erroring, dropping only that property", function()
+		local instanceMap = InstanceMap.new()
+
+		local target = Instance.new("ObjectValue")
+		instanceMap:insert("TARGET", target)
+
+		local other = Instance.new("Folder")
+		other.Parent = target
+		instanceMap:insert("OTHER", other)
+		target.Value = other
+
+		local changes = {
+			[target] = {
+				Value = true,
+			},
+		}
+
+		local patch = createPatchSet(instanceMap, changes)
+
+		-- The Value property can't be encoded on its own, so the instance has
+		-- no encodable changes and should not appear in the patch at all.
+		expect(#patch.updated).to.equal(0)
+		expect(next(changes)).to.equal(nil)
+	end)
+
 	it("should remove instances from the property change table", function()
 		local instanceMap = InstanceMap.new()
 

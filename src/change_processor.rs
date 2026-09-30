@@ -2,7 +2,8 @@ use crossbeam_channel::{select, Receiver, RecvError, Sender};
 use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
 use rbx_dom_weak::types::{Ref, Variant};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::{
     fs,
     sync::{Arc, Mutex},
@@ -10,10 +11,12 @@ use std::{
 
 use crate::{
     message_queue::MessageQueue,
+    project::Project,
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
     },
-    snapshot_middleware::{snapshot_from_vfs, snapshot_project_node},
+    snapshot_middleware::{snapshot_from_vfs, snapshot_project_node, Middleware},
+    syncback::{SyncbackData, SyncbackSnapshot},
 };
 
 /// Processes file change events, updates the DOM, and sends those updates
@@ -51,6 +54,7 @@ impl ChangeProcessor {
         vfs: Arc<Vfs>,
         message_queue: Arc<MessageQueue<AppliedPatchSet>>,
         tree_mutation_receiver: Receiver<PatchSet>,
+        project: Arc<Project>,
     ) -> Self {
         let (shutdown_sender, shutdown_receiver) = crossbeam_channel::bounded(1);
         let vfs_receiver = vfs.event_receiver();
@@ -58,6 +62,7 @@ impl ChangeProcessor {
             tree,
             vfs,
             message_queue,
+            project,
         };
 
         let job_thread = jod_thread::Builder::new()
@@ -111,6 +116,11 @@ struct JobThreadContext {
     /// Whenever changes are applied to the DOM, we should push those changes
     /// into this message queue to inform any connected clients.
     message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+
+    /// The root project for this session, used to reserialize instances back
+    /// to disk when a live two-way sync change touches something besides
+    /// BaseScript.Source.
+    project: Arc<Project>,
 }
 
 impl JobThreadContext {
@@ -192,6 +202,8 @@ impl JobThreadContext {
 
     fn handle_tree_event(&self, patch_set: PatchSet) {
         log::trace!("Applying PatchSet from client: {:#?}", patch_set);
+
+        let mut generic_writeback_ids: HashSet<Ref> = HashSet::new();
 
         let applied_patch = {
             let mut tree = self.tree.lock().unwrap();
@@ -277,7 +289,11 @@ impl JobThreadContext {
                                 );
                             }
                         } else {
-                            log::warn!("Cannot change properties besides BaseScript.Source.");
+                            // This property isn't BaseScript.Source, so it can't be
+                            // written back to disk immediately -- it needs the
+                            // fully-merged post-patch instance state. Queue it up and
+                            // handle it below, once `patch_set` has been applied.
+                            generic_writeback_ids.insert(id);
                         }
                     }
                 } else {
@@ -288,10 +304,140 @@ impl JobThreadContext {
             apply_patch_set(&mut tree, patch_set)
         };
 
+        if !generic_writeback_ids.is_empty() {
+            let tree = self.tree.lock().unwrap();
+            for id in generic_writeback_ids {
+                if let Err(err) =
+                    write_back_instance(&tree, &self.vfs, &self.project, id)
+                {
+                    log::warn!("Could not sync back property changes for {:?}: {:#}", id, err);
+                }
+            }
+        }
+
         if !applied_patch.is_empty() {
             self.message_queue.push_messages(&[applied_patch]);
         }
     }
+}
+
+/// Reserializes a single instance back to whatever file (or project node)
+/// created it, using its current, live properties. Used by two-way sync to
+/// write back property changes that aren't BaseScript.Source, which is
+/// special-cased separately since it's the original two-way sync feature.
+fn write_back_instance(
+    tree: &RojoTree,
+    vfs: &Vfs,
+    project: &Project,
+    id: Ref,
+) -> anyhow::Result<()> {
+    let instance = tree
+        .get_instance(id)
+        .ok_or_else(|| anyhow::anyhow!("instance no longer exists"))?;
+
+    let instigating_source = instance
+        .metadata()
+        .instigating_source
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("instance has no instigating source"))?;
+
+    match instigating_source {
+        InstigatingSource::Path(path) => {
+            write_back_path_instance(tree, vfs, project, id, &path)
+        }
+        InstigatingSource::ProjectNode { path, .. } => {
+            write_back_project_node(tree, vfs, project, id, &path)
+        }
+    }
+}
+
+/// Writes back an instance whose instigating source is a plain path (e.g. a
+/// `.rbxm`, `.model.json`, or `.txt` file) using the same per-middleware
+/// syncback logic as the full `rojo syncback` command, scoped to just this
+/// one instance.
+fn write_back_path_instance(
+    tree: &RojoTree,
+    vfs: &Vfs,
+    project: &Project,
+    id: Ref,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let metadata = tree
+        .get_metadata(id)
+        .ok_or_else(|| anyhow::anyhow!("instance no longer exists"))?;
+
+    let middleware = match metadata.middleware {
+        Some(middleware) => middleware,
+        None => Middleware::middleware_for_path(vfs, &project.sync_rules, path)?
+            .ok_or_else(|| anyhow::anyhow!("no middleware found for {}", path.display()))?,
+    };
+
+    let snapshot = SyncbackSnapshot {
+        data: SyncbackData::new(vfs, tree, tree.inner(), project),
+        old: Some(id),
+        new: id,
+        path: path.to_path_buf(),
+        middleware: Some(middleware),
+    };
+
+    let syncback = middleware.syncback(&snapshot)?;
+    syncback.fs_snapshot.write_to_vfs("", vfs)?;
+
+    Ok(())
+}
+
+/// Writes back an instance whose instigating source is a node inside a
+/// `.project.json` file (e.g. `$properties` set directly in the project).
+/// This walks up to the nearest ancestor whose instigating source is the
+/// project file itself, then reuses the project middleware's syncback, which
+/// diffs the live tree against a freshly re-read copy of the project file and
+/// rewrites only what changed.
+fn write_back_project_node(
+    tree: &RojoTree,
+    vfs: &Vfs,
+    project: &Project,
+    id: Ref,
+    project_path: &Path,
+) -> anyhow::Result<()> {
+    let mut root_id = id;
+    loop {
+        let metadata = tree
+            .get_metadata(root_id)
+            .ok_or_else(|| anyhow::anyhow!("instance no longer exists"))?;
+
+        if let Some(InstigatingSource::Path(path)) = &metadata.instigating_source {
+            if path == project_path {
+                break;
+            }
+        }
+
+        let instance = tree
+            .get_instance(root_id)
+            .ok_or_else(|| anyhow::anyhow!("instance no longer exists"))?;
+        let parent_id = instance.parent();
+
+        if parent_id == root_id {
+            anyhow::bail!(
+                "could not find the root instance for project file {}",
+                project_path.display()
+            );
+        }
+
+        root_id = parent_id;
+    }
+
+    let snapshot = SyncbackSnapshot {
+        data: SyncbackData::new(vfs, tree, tree.inner(), project),
+        old: Some(root_id),
+        new: root_id,
+        path: project_path.to_path_buf(),
+        middleware: Some(Middleware::Project),
+    };
+
+    let syncback = Middleware::Project.syncback(&snapshot)?;
+    syncback.fs_snapshot.write_to_vfs("", vfs)?;
+
+    Ok(())
 }
 
 fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<AppliedPatchSet> {

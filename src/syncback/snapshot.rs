@@ -22,6 +22,22 @@ pub struct SyncbackData<'sync> {
     pub(super) project: &'sync Project,
 }
 
+impl<'sync> SyncbackData<'sync> {
+    pub fn new(
+        vfs: &'sync Vfs,
+        old_tree: &'sync RojoTree,
+        new_tree: &'sync WeakDom,
+        project: &'sync Project,
+    ) -> Self {
+        Self {
+            vfs,
+            old_tree,
+            new_tree,
+            project,
+        }
+    }
+}
+
 pub struct SyncbackSnapshot<'sync> {
     pub data: SyncbackData<'sync>,
     pub old: Option<Ref>,

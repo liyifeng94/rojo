@@ -599,8 +599,18 @@ function EncodedValue.encode(rbxValue, propertyType)
 		return false, ("Missing encoder for property type %q"):format(propertyType)
 	end
 
+	-- Some encoders (e.g. Ref, Region3) unconditionally error() instead of
+	-- being representable on their own. Callers rely on this function to
+	-- report failures as (false, message) rather than raising, so a single
+	-- unencodable property doesn't take down the whole caller (for example,
+	-- the two-way sync ChangeBatcher, which should just skip that property).
+	local ok, result = pcall(typeImpl.toPod, rbxValue)
+	if not ok then
+		return false, result
+	end
+
 	return true, {
-		[propertyType] = typeImpl.toPod(rbxValue),
+		[propertyType] = result,
 	}
 end
 

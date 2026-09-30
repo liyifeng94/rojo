@@ -134,6 +134,7 @@ impl ServeSession {
             Arc::clone(&vfs),
             Arc::clone(&message_queue),
             tree_mutation_receiver,
+            Arc::new(root_project.clone()),
         );
 
         Ok(Self {
