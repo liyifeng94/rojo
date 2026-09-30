@@ -16,7 +16,7 @@ use crate::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
     },
     snapshot_middleware::{snapshot_from_vfs, snapshot_project_node, Middleware},
-    syncback::{SyncbackData, SyncbackSnapshot},
+    syncback::{FsSnapshot, SyncbackData, SyncbackSnapshot},
 };
 
 /// Processes file change events, updates the DOM, and sends those updates
@@ -58,11 +58,12 @@ impl ChangeProcessor {
     ) -> Self {
         let (shutdown_sender, shutdown_receiver) = crossbeam_channel::bounded(1);
         let vfs_receiver = vfs.event_receiver();
-        let task = JobThreadContext {
+        let mut task = JobThreadContext {
             tree,
             vfs,
             message_queue,
             project,
+            suppressed_vfs_paths: HashSet::new(),
         };
 
         let job_thread = jod_thread::Builder::new()
@@ -121,6 +122,11 @@ struct JobThreadContext {
     /// to disk when a live two-way sync change touches something besides
     /// BaseScript.Source.
     project: Arc<Project>,
+
+    /// Files this processor just wrote because of a client patch. The filesystem
+    /// watcher reports those writes back as if someone else edited them. They
+    /// are dropped so a live edit does not sync back into Studio and bounce.
+    suppressed_vfs_paths: HashSet<PathBuf>,
 }
 
 impl JobThreadContext {
@@ -167,13 +173,46 @@ impl JobThreadContext {
         applied_patches
     }
 
-    fn handle_vfs_event(&self, event: VfsEvent) {
+    fn suppress_path(&mut self, path: &Path) {
+        let canonical = self
+            .vfs
+            .canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf());
+        self.suppressed_vfs_paths.insert(canonical);
+    }
+
+    fn take_suppressed(&mut self, path: &Path) -> bool {
+        let canonical = self
+            .vfs
+            .canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf());
+        self.suppressed_vfs_paths.remove(&canonical) || self.suppressed_vfs_paths.remove(path)
+    }
+
+    fn handle_vfs_event(&mut self, event: VfsEvent) {
         log::trace!("Vfs event: {:?}", event);
+
+        let event_path = match &event {
+            VfsEvent::Create(path) | VfsEvent::Write(path) | VfsEvent::Remove(path) => {
+                Some(path.clone())
+            }
+            _ => None,
+        };
 
         // Update the VFS immediately with the event.
         self.vfs
             .commit_event(&event)
             .expect("Error applying VFS change");
+
+        if let Some(path) = event_path {
+            if self.take_suppressed(&path) {
+                log::trace!(
+                    "Ignoring filesystem event for {} because this serve session just wrote it",
+                    path.display()
+                );
+                return;
+            }
+        }
 
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
@@ -200,12 +239,13 @@ impl JobThreadContext {
         self.message_queue.push_messages(&applied_patches);
     }
 
-    fn handle_tree_event(&self, patch_set: PatchSet) {
+    fn handle_tree_event(&mut self, patch_set: PatchSet) {
         log::trace!("Applying PatchSet from client: {:#?}", patch_set);
 
         let mut generic_writeback_ids: HashSet<Ref> = HashSet::new();
+        let mut written_paths: Vec<PathBuf> = Vec::new();
 
-        let applied_patch = {
+        {
             let mut tree = self.tree.lock().unwrap();
 
             for &id in &patch_set.removed_instances {
@@ -219,6 +259,8 @@ impl JobThreadContext {
                                         path.display(),
                                         err
                                     );
+                                } else {
+                                    written_paths.push(path.clone());
                                 }
                             }
                             InstigatingSource::ProjectNode { .. } => {
@@ -270,6 +312,8 @@ impl JobThreadContext {
                                                     path.display(),
                                                     err
                                                 );
+                                            } else {
+                                                written_paths.push(path.clone());
                                             }
                                         } else {
                                             log::warn!("Cannot change Source to non-string value.");
@@ -307,17 +351,21 @@ impl JobThreadContext {
         if !generic_writeback_ids.is_empty() {
             let tree = self.tree.lock().unwrap();
             for id in generic_writeback_ids {
-                if let Err(err) =
-                    write_back_instance(&tree, &self.vfs, &self.project, id)
-                {
-                    log::warn!("Could not sync back property changes for {:?}: {:#}", id, err);
+                match write_back_instance(&tree, &self.vfs, &self.project, id) {
+                    Ok(paths) => written_paths.extend(paths),
+                    Err(err) => {
+                        log::warn!("Could not sync back property changes for {:?}: {:#}", id, err);
+                    }
                 }
             }
         }
 
-        if !applied_patch.is_empty() {
-            self.message_queue.push_messages(&[applied_patch]);
+        for path in written_paths {
+            self.suppress_path(&path);
         }
+
+        // Client-originated patches are not rebroadcast. The plugin already
+        // has these values, and applying them again bounces the edit.
     }
 }
 
@@ -330,7 +378,7 @@ fn write_back_instance(
     vfs: &Vfs,
     project: &Project,
     id: Ref,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<PathBuf>> {
     let instance = tree
         .get_instance(id)
         .ok_or_else(|| anyhow::anyhow!("instance no longer exists"))?;
@@ -361,7 +409,7 @@ fn write_back_path_instance(
     project: &Project,
     id: Ref,
     path: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<PathBuf>> {
     let metadata = tree
         .get_metadata(id)
         .ok_or_else(|| anyhow::anyhow!("instance no longer exists"))?;
@@ -381,9 +429,10 @@ fn write_back_path_instance(
     };
 
     let syncback = middleware.syncback(&snapshot)?;
+    let written = written_paths(&syncback.fs_snapshot);
     syncback.fs_snapshot.write_to_vfs("", vfs)?;
 
-    Ok(())
+    Ok(written)
 }
 
 /// Writes back an instance whose instigating source is a node inside a
@@ -398,7 +447,7 @@ fn write_back_project_node(
     project: &Project,
     id: Ref,
     project_path: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut root_id = id;
     loop {
         let metadata = tree
@@ -435,9 +484,19 @@ fn write_back_project_node(
     };
 
     let syncback = Middleware::Project.syncback(&snapshot)?;
+    let written = written_paths(&syncback.fs_snapshot);
     syncback.fs_snapshot.write_to_vfs("", vfs)?;
 
-    Ok(())
+    Ok(written)
+}
+
+fn written_paths(snapshot: &FsSnapshot) -> Vec<PathBuf> {
+    snapshot
+        .added_files()
+        .into_iter()
+        .chain(snapshot.removed_files())
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<AppliedPatchSet> {
