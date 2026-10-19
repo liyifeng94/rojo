@@ -65,12 +65,19 @@ impl<'a> SubscribeMessage<'a> {
                     .filter(|(_key, value)| property_filter(value.as_ref()))
                     .collect();
 
+                let (source_path, source_mtime) = tree
+                    .get_instance(update.id)
+                    .map(|instance| source_stamp(instance.metadata()))
+                    .unwrap_or((None, None));
+
                 InstanceUpdate {
                     id: update.id,
                     changed_name: update.changed_name,
                     changed_class_name: update.changed_class_name,
                     changed_properties,
                     changed_metadata,
+                    source_path,
+                    source_mtime,
                 }
             })
             .collect();
@@ -95,18 +102,56 @@ pub struct InstanceUpdate {
     #[serde(default)]
     pub changed_properties: UstrMap<Option<Variant>>,
     pub changed_metadata: Option<InstanceMetadata>,
+
+    /// File that owns this instance, when it came from disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+
+    /// Modification time of `source_path`, in unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mtime: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceMetadata {
     pub ignore_unknown_instances: bool,
+
+    /// File that owns this instance, when it came from disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+
+    /// Modification time of `source_path`, in unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mtime: Option<u64>,
+}
+
+fn source_stamp(meta: &RojoInstanceMetadata) -> (Option<String>, Option<u64>) {
+    let Some(source) = meta.instigating_source.as_ref() else {
+        return (None, None);
+    };
+
+    let path = source.path();
+    let path_string = path.to_string_lossy().into_owned();
+    let mtime = std::fs::metadata(path).ok().and_then(|metadata| {
+        metadata.modified().ok().and_then(|modified| {
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_millis() as u64)
+        })
+    });
+
+    (Some(path_string), mtime)
 }
 
 impl InstanceMetadata {
     pub(crate) fn from_rojo_metadata(meta: &RojoInstanceMetadata) -> Self {
+        let (source_path, source_mtime) = source_stamp(meta);
         Self {
             ignore_unknown_instances: meta.ignore_unknown_instances,
+            source_path,
+            source_mtime,
         }
     }
 }

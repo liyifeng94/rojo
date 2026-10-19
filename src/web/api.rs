@@ -337,6 +337,8 @@ impl ApiService {
                                 changed_name: None,
                                 changed_metadata: None,
                                 changed_properties: UstrMap::default(),
+                                source_path: None,
+                                source_mtime: None,
                             });
                     update
                         .changed_properties

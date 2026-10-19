@@ -27,6 +27,9 @@ local defaultSettings = {
 	logLevel = "Info",
 	timingLogsEnabled = false,
 	priorEndpoints = {},
+	syncState = {
+		files = {},
+	},
 }
 
 local Settings = {}

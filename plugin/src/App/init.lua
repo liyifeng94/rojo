@@ -751,11 +751,9 @@ function App:startSession()
 		end
 
 		local function autoDecision(reason)
-			-- Two-way sync must not silently replace Studio (including other
-			-- Team Create editors) with the files on disk.
 			if Settings:get("twoWaySync") then
-				Log.trace("Keeping Studio changes because {}", reason)
-				return "KeepStudio"
+				Log.trace("Syncing whichever side is newer because {}", reason)
+				return "NewerWins"
 			end
 
 			Log.trace("Accepting patch without confirmation because {}", reason)

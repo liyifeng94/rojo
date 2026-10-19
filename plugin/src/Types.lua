@@ -9,6 +9,8 @@ local ApiValue = t.keys(t.string)
 
 local ApiInstanceMetadata = t.interface({
 	ignoreUnknownInstances = t.optional(t.boolean),
+	sourcePath = t.optional(t.string),
+	sourceMtime = t.optional(t.number),
 })
 
 local ApiInstance = t.interface({
@@ -27,6 +29,8 @@ local ApiInstanceUpdate = t.interface({
 	changedClassName = t.optional(t.string),
 	changedProperties = t.map(t.string, ApiValue),
 	changedMetadata = t.optional(ApiInstanceMetadata),
+	sourcePath = t.optional(t.string),
+	sourceMtime = t.optional(t.number),
 })
 
 local ApiSubscribeMessage = t.interface({

@@ -19,6 +19,7 @@ local Reconciler = require(script.Parent.Reconciler)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
+local newerSource = require(script.Parent.newerSource)
 
 local Status = strict("Session.Status", {
 	NotStarted = "NotStarted",
@@ -60,6 +61,24 @@ ServeSession.__index = ServeSession
 
 ServeSession.Status = Status
 
+local function copySyncState(saved)
+	local files = {}
+	if type(saved) == "table" and type(saved.files) == "table" then
+		for path, record in saved.files do
+			if type(record) == "table" then
+				files[path] = {
+					mtime = record.mtime,
+					studioChangedAt = record.studioChangedAt,
+				}
+			end
+		end
+	end
+
+	return {
+		files = files,
+	}
+end
+
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
 	twoWaySync = t.boolean,
@@ -75,15 +94,7 @@ function ServeSession.new(options)
 			return
 		end
 
-		-- Remember Studio-authored edits so a later filesystem patch cannot
-		-- overwrite them before they are written to disk.
-		local edits = self.__studioEdits[instance]
-		if edits == nil then
-			edits = {}
-			self.__studioEdits[instance] = edits
-		end
-		edits[propertyName] = true
-
+		self:__noteStudioChange(instance)
 		self.__changeBatcher:add(instance, propertyName)
 	end
 
@@ -91,7 +102,7 @@ function ServeSession.new(options)
 		local written = self.__apiContext:write(patch)
 		if type(written) == "table" and type(written.andThen) == "function" then
 			written:andThen(function()
-				self:__clearStudioEdits(patch)
+				self:__noteStudioWritten(patch)
 			end)
 		end
 	end
@@ -118,7 +129,8 @@ function ServeSession.new(options)
 		__reconciler = reconciler,
 		__instanceMap = instanceMap,
 		__changeBatcher = changeBatcher,
-		__studioEdits = {},
+		__sourceById = {},
+		__syncState = copySyncState(Settings:get("syncState")),
 		__statusChangedCallback = nil,
 		__connections = connections,
 		__precommitCallbacks = {},
@@ -419,68 +431,136 @@ function ServeSession:__replaceInstances(idList)
 	end
 end
 
-function ServeSession:__clearStudioEdits(patch)
-	for _, update in patch.updated do
-		local instance = self.__instanceMap.fromIds[update.id]
-		local edits = instance and self.__studioEdits[instance]
-		if edits == nil then
-			continue
-		end
+function ServeSession:__fileRecord(path)
+	local files = self.__syncState.files
+	local record = files[path]
+	if record == nil then
+		record = {}
+		files[path] = record
+	end
+	return record
+end
 
-		if update.changedName ~= nil then
-			edits.Name = nil
-		end
+function ServeSession:__saveSyncState()
+	Settings:set("syncState", self.__syncState)
+end
 
-		if update.changedProperties ~= nil then
-			for propertyName in update.changedProperties do
-				edits[propertyName] = nil
-			end
-		end
-
-		if next(edits) == nil then
-			self.__studioEdits[instance] = nil
+function ServeSession:__rememberSources(instances)
+	for id, virtual in instances do
+		local metadata = virtual.Metadata
+		if metadata ~= nil and metadata.sourcePath ~= nil then
+			self.__sourceById[id] = {
+				path = metadata.sourcePath,
+				mtime = metadata.sourceMtime,
+			}
 		end
 	end
 end
 
--- Drops property updates that would replace a Studio edit that has not been
--- written to disk yet, and keeps those edits queued for write-back.
-function ServeSession:__stripUnwrittenStudioEdits(patch)
+function ServeSession:__noteStudioChange(instance)
+	local id = self.__instanceMap.fromInstances[instance]
+	local source = id and self.__sourceById[id]
+	if source == nil or source.path == nil then
+		return
+	end
+
+	local record = self:__fileRecord(source.path)
+	record.studioChangedAt = DateTime.now().UnixTimestampMillis
+	self:__saveSyncState()
+end
+
+function ServeSession:__noteStudioWritten(patch)
+	local now = DateTime.now().UnixTimestampMillis
+	for _, update in patch.updated do
+		local source = self.__sourceById[update.id]
+		if source ~= nil and source.path ~= nil then
+			local record = self:__fileRecord(source.path)
+			record.mtime = now
+			record.studioChangedAt = nil
+		end
+	end
+	self:__saveSyncState()
+end
+
+function ServeSession:__rememberDisk(path, mtime)
+	if path == nil or type(mtime) ~= "number" then
+		return
+	end
+
+	local record = self:__fileRecord(path)
+	record.mtime = mtime
+	record.studioChangedAt = nil
+end
+
+-- A live filesystem patch is applied only when the file is newer than the
+-- latest Studio edit. Otherwise the Studio value stays and is written locally.
+function ServeSession:__keepNewerSide(patch)
 	if not self.__twoWaySync then
 		return
 	end
 
 	for _, update in patch.updated do
 		local instance = self.__instanceMap.fromIds[update.id]
-		local edits = instance and self.__studioEdits[instance]
-		if edits == nil then
+		if instance == nil then
 			continue
 		end
 
-		if update.changedName ~= nil and edits.Name then
-			Log.info("Keeping Studio name of {} instead of overwriting it from disk", instance:GetFullName())
-			update.changedName = nil
-			self.__changeBatcher:add(instance, "Name")
+		if update.sourcePath ~= nil then
+			self.__sourceById[update.id] = {
+				path = update.sourcePath,
+				mtime = update.sourceMtime,
+			}
 		end
 
-		if update.changedProperties ~= nil then
-			for propertyName in edits do
-				if update.changedProperties[propertyName] ~= nil then
-					Log.info(
-						"Keeping Studio property {}.{} instead of overwriting it from disk",
-						instance:GetFullName(),
-						propertyName
-					)
+		local source = self.__sourceById[update.id]
+		local path = if update.sourcePath ~= nil then update.sourcePath else source and source.path
+		local mtime = if update.sourceMtime ~= nil then update.sourceMtime else source and source.mtime
+		local record = path and self.__syncState.files[path]
+		local choice = newerSource(mtime, record and record.mtime, record and record.studioChangedAt, true)
+
+		if choice == "studio" then
+			Log.info("Studio copy of {} is newer than the file; writing it locally", instance:GetFullName())
+			if update.changedName ~= nil then
+				update.changedName = nil
+				self.__changeBatcher:add(instance, "Name")
+			end
+			if update.changedProperties ~= nil then
+				local propertyNames = {}
+				for propertyName in update.changedProperties do
+					table.insert(propertyNames, propertyName)
+				end
+				for _, propertyName in propertyNames do
 					update.changedProperties[propertyName] = nil
 					self.__changeBatcher:add(instance, propertyName)
 				end
 			end
+		else
+			self:__rememberDisk(path, mtime)
 		end
 	end
+
+	self:__saveSyncState()
 end
 
-function ServeSession:__applyPatch(patch)
-	self:__stripUnwrittenStudioEdits(patch)
+function ServeSession:__queueStudioWrite(change, instance)
+	local properties = {}
+	if change.changedProperties ~= nil then
+		for propertyName in change.changedProperties do
+			properties[propertyName] = true
+		end
+	end
+	if change.changedName ~= nil then
+		properties.Name = true
+	end
+
+	local update = encodePatchUpdate(instance, change.id, properties)
+	return update
+end
+
+function ServeSession:__applyPatch(patch, alreadyChosen)
+	if not alreadyChosen then
+		self:__keepNewerSide(patch)
+	end
 
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
 	local historyRecording = ChangeHistoryService:TryBeginRecording("Rojo: Patch " .. patchTimestamp)
@@ -566,6 +646,7 @@ function ServeSession:__initialSync(serverInfo)
 		-- Tell the API Context that we're up-to-date with the version of
 		-- the tree defined in this response.
 		self.__apiContext:setMessageCursor(readResponseBody.messageCursor)
+		self:__rememberSources(readResponseBody.instances)
 
 		-- For any instances that line up with the Rojo server's view, start
 		-- tracking them in the reconciler.
@@ -606,46 +687,82 @@ function ServeSession:__initialSync(serverInfo)
 
 		if userDecision == "Abort" then
 			return Promise.reject("Aborted Rojo sync operation")
-		elseif userDecision == "KeepStudio" then
-			-- Studio has changes, often from another Team Create editor, that
-			-- are not in the local files. Write those properties out instead of
-			-- applying the files over them. Instances that exist only on disk
-			-- are still added.
+		elseif userDecision == "NewerWins" then
+			local applyPatch = PatchSet.newEmpty()
 			local writePatch = PatchSet.newEmpty()
 
-			for _, change in catchUpPatch.updated do
-				local instance = self.__instanceMap.fromIds[change.id]
-				if not instance then
-					continue
-				end
-
-				local properties = {}
-				if change.changedProperties ~= nil then
-					for propertyName in change.changedProperties do
-						properties[propertyName] = true
-					end
-				end
-				if change.changedName ~= nil then
-					properties.Name = true
-				end
-
-				local update = encodePatchUpdate(instance, change.id, properties)
-				if update ~= nil then
-					table.insert(writePatch.updated, update)
+			for id, virtual in catchUpPatch.added do
+				local metadata = virtual.Metadata
+				local path = metadata and metadata.sourcePath
+				local mtime = metadata and metadata.sourceMtime
+				local record = path and self.__syncState.files[path]
+				local choice = newerSource(mtime, record and record.mtime, record and record.studioChangedAt, false)
+				if choice ~= "studio" then
+					applyPatch.added[id] = virtual
+					self:__rememberDisk(path, mtime)
 				end
 			end
 
-			local additions = PatchSet.newEmpty()
-			additions.added = catchUpPatch.added
-			if not PatchSet.isEmpty(additions) then
-				self:__applyPatch(additions)
+			for _, removed in catchUpPatch.removed do
+				local id = self.__instanceMap.fromInstances[removed]
+				local source = id and self.__sourceById[id]
+				local path = source and source.path
+				local record = path and self.__syncState.files[path]
+				local choice = newerSource(
+					source and source.mtime,
+					record and record.mtime,
+					record and record.studioChangedAt,
+					false
+				)
+				if choice == "disk" then
+					table.insert(applyPatch.removed, removed)
+				end
+			end
+
+			for _, change in catchUpPatch.updated do
+				local instance = self.__instanceMap.fromIds[change.id]
+				local source = self.__sourceById[change.id]
+				local path = source and source.path
+				local mtime = source and source.mtime
+				local record = path and self.__syncState.files[path]
+				local choice = newerSource(mtime, record and record.mtime, record and record.studioChangedAt, false)
+
+				if choice == "disk" then
+					table.insert(applyPatch.updated, change)
+					self:__rememberDisk(path, mtime)
+				elseif choice == "studio" and instance ~= nil then
+					local update = self:__queueStudioWrite(change, instance)
+					if update ~= nil then
+						table.insert(writePatch.updated, update)
+					end
+					if path ~= nil then
+						local written = self:__fileRecord(path)
+						written.mtime = DateTime.now().UnixTimestampMillis
+						written.studioChangedAt = nil
+					end
+					Log.info(
+						"Studio copy of {} is newer than the file; writing it locally",
+						instance:GetFullName()
+					)
+				elseif instance ~= nil then
+					Log.info(
+						"No sync history for {}, so neither side was applied",
+						instance:GetFullName()
+					)
+				end
+			end
+
+			self:__saveSyncState()
+
+			if not PatchSet.isEmpty(applyPatch) then
+				self:__applyPatch(applyPatch, true)
 			end
 
 			if PatchSet.isEmpty(writePatch) then
 				return Promise.resolve()
 			end
 
-			Log.info("Writing Studio changes into the local project instead of overwriting them")
+			Log.info("Writing newer Studio changes into the local project")
 			return self.__apiContext:write(writePatch)
 		elseif userDecision == "Reject" then
 			if not self.__twoWaySync then
@@ -678,7 +795,11 @@ function ServeSession:__initialSync(serverInfo)
 
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
-			self:__applyPatch(catchUpPatch)
+			for _, source in self.__sourceById do
+				self:__rememberDisk(source.path, source.mtime)
+			end
+			self:__saveSyncState()
+			self:__applyPatch(catchUpPatch, true)
 			return Promise.resolve()
 		else
 			return Promise.reject("Invalid user decision: " .. userDecision)
