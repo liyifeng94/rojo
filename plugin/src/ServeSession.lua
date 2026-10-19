@@ -75,11 +75,25 @@ function ServeSession.new(options)
 			return
 		end
 
+		-- Remember Studio-authored edits so a later filesystem patch cannot
+		-- overwrite them before they are written to disk.
+		local edits = self.__studioEdits[instance]
+		if edits == nil then
+			edits = {}
+			self.__studioEdits[instance] = edits
+		end
+		edits[propertyName] = true
+
 		self.__changeBatcher:add(instance, propertyName)
 	end
 
 	local function onChangesFlushed(patch)
-		self.__apiContext:write(patch)
+		local written = self.__apiContext:write(patch)
+		if type(written) == "table" and type(written.andThen) == "function" then
+			written:andThen(function()
+				self:__clearStudioEdits(patch)
+			end)
+		end
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged)
@@ -104,6 +118,7 @@ function ServeSession.new(options)
 		__reconciler = reconciler,
 		__instanceMap = instanceMap,
 		__changeBatcher = changeBatcher,
+		__studioEdits = {},
 		__statusChangedCallback = nil,
 		__connections = connections,
 		__precommitCallbacks = {},
@@ -404,7 +419,69 @@ function ServeSession:__replaceInstances(idList)
 	end
 end
 
+function ServeSession:__clearStudioEdits(patch)
+	for _, update in patch.updated do
+		local instance = self.__instanceMap.fromIds[update.id]
+		local edits = instance and self.__studioEdits[instance]
+		if edits == nil then
+			continue
+		end
+
+		if update.changedName ~= nil then
+			edits.Name = nil
+		end
+
+		if update.changedProperties ~= nil then
+			for propertyName in update.changedProperties do
+				edits[propertyName] = nil
+			end
+		end
+
+		if next(edits) == nil then
+			self.__studioEdits[instance] = nil
+		end
+	end
+end
+
+-- Drops property updates that would replace a Studio edit that has not been
+-- written to disk yet, and keeps those edits queued for write-back.
+function ServeSession:__stripUnwrittenStudioEdits(patch)
+	if not self.__twoWaySync then
+		return
+	end
+
+	for _, update in patch.updated do
+		local instance = self.__instanceMap.fromIds[update.id]
+		local edits = instance and self.__studioEdits[instance]
+		if edits == nil then
+			continue
+		end
+
+		if update.changedName ~= nil and edits.Name then
+			Log.info("Keeping Studio name of {} instead of overwriting it from disk", instance:GetFullName())
+			update.changedName = nil
+			self.__changeBatcher:add(instance, "Name")
+		end
+
+		if update.changedProperties ~= nil then
+			for propertyName in edits do
+				if update.changedProperties[propertyName] ~= nil then
+					Log.info(
+						"Keeping Studio property {}.{} instead of overwriting it from disk",
+						instance:GetFullName(),
+						propertyName
+					)
+					update.changedProperties[propertyName] = nil
+					self.__changeBatcher:add(instance, propertyName)
+				end
+			end
+		end
+	end
+end
+
 function ServeSession:__applyPatch(patch)
+	self:__stripUnwrittenStudioEdits(patch)
+
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
 	local historyRecording = ChangeHistoryService:TryBeginRecording("Rojo: Patch " .. patchTimestamp)
 	if not historyRecording then
@@ -529,6 +606,47 @@ function ServeSession:__initialSync(serverInfo)
 
 		if userDecision == "Abort" then
 			return Promise.reject("Aborted Rojo sync operation")
+		elseif userDecision == "KeepStudio" then
+			-- Studio has changes, often from another Team Create editor, that
+			-- are not in the local files. Write those properties out instead of
+			-- applying the files over them. Instances that exist only on disk
+			-- are still added.
+			local writePatch = PatchSet.newEmpty()
+
+			for _, change in catchUpPatch.updated do
+				local instance = self.__instanceMap.fromIds[change.id]
+				if not instance then
+					continue
+				end
+
+				local properties = {}
+				if change.changedProperties ~= nil then
+					for propertyName in change.changedProperties do
+						properties[propertyName] = true
+					end
+				end
+				if change.changedName ~= nil then
+					properties.Name = true
+				end
+
+				local update = encodePatchUpdate(instance, change.id, properties)
+				if update ~= nil then
+					table.insert(writePatch.updated, update)
+				end
+			end
+
+			local additions = PatchSet.newEmpty()
+			additions.added = catchUpPatch.added
+			if not PatchSet.isEmpty(additions) then
+				self:__applyPatch(additions)
+			end
+
+			if PatchSet.isEmpty(writePatch) then
+				return Promise.resolve()
+			end
+
+			Log.info("Writing Studio changes into the local project instead of overwriting them")
+			return self.__apiContext:write(writePatch)
 		elseif userDecision == "Reject" then
 			if not self.__twoWaySync then
 				return Promise.reject("Cannot reject sync operation without two-way sync enabled")
